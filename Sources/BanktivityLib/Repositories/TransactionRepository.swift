@@ -109,7 +109,8 @@ public final class TransactionRepository: BaseRepository, @unchecked Sendable {
         date: String,
         title: String,
         note: String? = nil,
-        lineItems: [(accountId: Int, amount: Double, memo: String?)]
+        lineItems: [(accountId: Int, amount: Double, memo: String?)],
+        transactionType: String? = nil
     ) throws -> TransactionDTO {
         struct SyncInfo: Sendable {
             let txUUID: String
@@ -133,29 +134,11 @@ public final class TransactionRepository: BaseRepository, @unchecked Sendable {
             Self.setNow(tx, "pModificationDate")
             Self.setDate(tx, "pDate", isoString: date)
 
-            // Set default transaction type (fetch the first available)
-            let typeRequest = NSFetchRequest<NSManagedObject>(entityName: "TransactionType")
-            typeRequest.fetchLimit = 1
-            let txType = try ctx.fetch(typeRequest).first
-            if let txType = txType {
-                tx.setValue(txType, forKey: "pTransactionType")
-            }
-
-            let txTypeBaseType: String = {
-                guard let txType = txType else { return "deposit" }
-                let bt = Self.intValue(txType, "pBaseType")
-                switch bt {
-                case 0: return "withdrawal"
-                case 1: return "deposit"
-                default: return "deposit"
-                }
-            }()
-            let txTypeUUID = txType.map { Self.stringValue($0, "pUniqueID") } ?? ""
-
             // Create line items
             var currencySet = false
             var currencyUUID = ""
             var syncLineItems: [SyncBlobUpdater.SyncLineItem] = []
+            var transactionTypeLineItems: [TransactionTypeLineItem] = []
 
             var totalAmount = 0.0
 
@@ -165,6 +148,11 @@ public final class TransactionRepository: BaseRepository, @unchecked Sendable {
                 }
 
                 let accountUUID = Self.stringValue(account, "pUniqueID")
+                transactionTypeLineItems.append(TransactionTypeLineItem(
+                    accountId: liInput.accountId,
+                    amount: liInput.amount,
+                    accountClass: Self.intValue(account, "pAccountClass")
+                ))
 
                 // Use the first account's currency for the transaction
                 if !currencySet, let currency = Self.relatedObject(account, "currency") {
@@ -193,6 +181,15 @@ public final class TransactionRepository: BaseRepository, @unchecked Sendable {
                     securityLineItem: nil, transactionAmount: liInput.amount
                 ))
             }
+
+            let resolvedTypeName = Self.determineTransactionType(
+                lineItems: transactionTypeLineItems,
+                explicitTransactionType: transactionType
+            )
+            let txType = try Self.fetchTransactionType(named: resolvedTypeName, in: ctx)
+            tx.setValue(txType, forKey: "pTransactionType")
+            let txTypeBaseType = Self.transactionTypeBaseTypeName(Self.intValue(txType, "pBaseType"))
+            let txTypeUUID = Self.stringValue(txType, "pUniqueID")
 
             // Create balancing offset line item if the explicit line items don't sum to zero.
             // Banktivity requires every transaction to have a balancing offset — without it,
@@ -399,12 +396,88 @@ public final class TransactionRepository: BaseRepository, @unchecked Sendable {
 
     // MARK: - Transaction Type Mapping
 
+    struct TransactionTypeLineItem: Sendable {
+        let accountId: Int
+        let amount: Double
+        let accountClass: Int
+    }
+
+    static let bankLikeAccountClasses: Set<Int> = [1000, 1001, 1002, 1003, 5001]
+
+    static func determineTransactionType(
+        lineItems: [TransactionTypeLineItem],
+        explicitTransactionType: String? = nil
+    ) -> String {
+        if let explicitTransactionType,
+           !explicitTransactionType.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return normalizeTransactionTypeName(explicitTransactionType)
+        }
+
+        let bankLines = lineItems.filter { bankLikeAccountClasses.contains($0.accountClass) && abs($0.amount) > 0.001 }
+
+        if bankLines.count == 1, let bankLine = bankLines.first {
+            return bankLine.amount < 0 ? "withdrawal" : "deposit"
+        }
+
+        if bankLines.count == 2 {
+            let hasPositive = bankLines.contains { $0.amount > 0 }
+            let hasNegative = bankLines.contains { $0.amount < 0 }
+            if hasPositive && hasNegative {
+                return "transfer"
+            }
+        }
+
+        if bankLines.isEmpty {
+            fputs("Warning: unable to auto-determine transaction type from bank-like line items; defaulting to withdrawal\n", stderr)
+        }
+
+        return "withdrawal"
+    }
+
+    static func normalizeTransactionTypeName(_ name: String) -> String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "-")
+            .replacingOccurrences(of: " ", with: "-")
+            .replacingOccurrences(of: "--", with: "-")
+    }
+
+    static func fetchTransactionType(named name: String, in ctx: NSManagedObjectContext) throws -> NSManagedObject {
+        let normalizedName = normalizeTransactionTypeName(name)
+        let request = NSFetchRequest<NSManagedObject>(entityName: "TransactionType")
+        request.sortDescriptors = [NSSortDescriptor(key: "pBaseType", ascending: true)]
+        let transactionTypes = try ctx.fetch(request)
+
+        if let byStoredName = transactionTypes.first(where: { Self.normalizeTransactionTypeName(Self.stringValue($0, "pName")) == normalizedName }) {
+            return byStoredName
+        }
+
+        if let byBaseTypeName = transactionTypes.first(where: { Self.transactionTypeBaseTypeName(Self.intValue($0, "pBaseType")) == normalizedName }) {
+            return byBaseTypeName
+        }
+
+        if let baseType = transactionTypeBaseTypeCode(normalizedName),
+           let byBaseType = transactionTypes.first(where: { Self.intValue($0, "pBaseType") == baseType }) {
+            return byBaseType
+        }
+
+        let validTypes = Set(transactionTypes
+            .map { Self.normalizeTransactionTypeName(Self.stringValue($0, "pName")) }
+            .filter { !$0.isEmpty })
+            .sorted()
+            .joined(separator: ", ")
+        throw ToolError.invalidInput("Unknown transaction type: \(name). Valid types: \(validTypes)")
+    }
+
     static func transactionTypeBaseTypeCode(_ name: String) -> Int? {
-        switch name.lowercased() {
+        switch normalizeTransactionTypeName(name) {
         case "deposit": return 1
         case "withdrawal": return 2
         case "transfer": return 3
         case "check": return 4
+        case "charge": return 5
+        case "refund": return 6
+        case "payment": return 7
         case "buy": return 100
         case "sell": return 101
         case "buy-to-open": return 102
@@ -415,7 +488,12 @@ public final class TransactionRepository: BaseRepository, @unchecked Sendable {
         case "move-shares-out": return 211
         case "transfer-shares": return 212
         case "split-shares": return 250
+        case "investment-income": return 300
         case "dividend": return 301
+        case "cap-gains-short", "capital-gains-short": return 302
+        case "cap-gains-long", "capital-gains-long": return 303
+        case "interest-income": return 304
+        case "return-of-capital": return 310
         default: return nil
         }
     }
@@ -426,6 +504,9 @@ public final class TransactionRepository: BaseRepository, @unchecked Sendable {
         case 2: return "withdrawal"
         case 3: return "transfer"
         case 4: return "check"
+        case 5: return "charge"
+        case 6: return "refund"
+        case 7: return "payment"
         case 100: return "buy"
         case 101: return "sell"
         case 102: return "buy-to-open"

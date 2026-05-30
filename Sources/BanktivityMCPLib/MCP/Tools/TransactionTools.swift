@@ -94,6 +94,7 @@ func registerTransactionTools(
                 "date": ToolHelpers.property(type: "string", description: "Transaction date in ISO format (YYYY-MM-DD)"),
                 "title": ToolHelpers.property(type: "string", description: "Transaction title/payee"),
                 "note": ToolHelpers.property(type: "string", description: "Optional note"),
+                "transaction_type": ToolHelpers.property(type: "string", description: "Optional explicit transaction type (deposit, withdrawal, transfer, etc.). If omitted, type is auto-determined from line items."),
                 "line_items": ToolHelpers.property(type: "array", description: "Line items: [{account_id, amount, memo?}]"),
             ],
             required: ["date", "title", "line_items"]
@@ -113,6 +114,7 @@ func registerTransactionTools(
         }
 
         let note = ToolHelpers.getString(arguments, key: "note")
+        let transactionType = ToolHelpers.getString(arguments, key: "transaction_type")
 
         // Parse line items
         var lineItems: [(accountId: Int, amount: Double, memo: String?)] = []
@@ -143,7 +145,8 @@ func registerTransactionTools(
             date: date,
             title: title,
             note: note,
-            lineItems: lineItems
+            lineItems: lineItems,
+            transactionType: transactionType
         )
 
         return try ToolHelpers.jsonResponse(result)
